@@ -1,6 +1,93 @@
-#include <stdio.h>
+#include "run.h"
+#include <string.h>
 
-int main() {
-    printf("Hello, World!\n");
-    return 0;
+static uint64_t generate_flow_key(void) {
+    // combine three rand() calls to fill 64 bits
+    uint64_t a = (uint64_t)(rand() & 0xffff);
+    uint64_t b = (uint64_t)rand();
+    uint64_t c = (uint64_t)(rand() & 0xffff);
+    return (a << 48) ^ (b << 16) ^ c;
+}
+
+static uint32_t generate_flow_weight(void) {
+    return (uint32_t)(1 + (rand() % 100)); // weights in [1,100]
+}
+
+static void reset_state(void) {
+    memset(cms_sketch, 0, sizeof(cms_sketch));
+    memset(bloom_filter_map, 0, sizeof(bloom_filter_map));
+    memset(flows, 0, sizeof(flows));
+}
+
+static void dump_arrays(void) {
+    // Dump cms_sketch
+    for (int row = 0; row < D; ++row) {
+        printf("cms_sketch row %d:\n", row);
+        for (int col = 0; col < W; ++col) {
+            printf("%u%c", cms_sketch[row][col], (col == W - 1) ? '\n' : ' ');
+        }
+    }
+
+    // Dump bloom filter map
+    for (int i = 0; i < BLOOM_FILTER_HASH_COUNT; ++i) {
+        printf("bloom_filter_map hash %d:\n", i);
+        for (int j = 0; j < BLOOM_FILTER_SIZE; ++j) {
+            printf("%u%c", bloom_filter_map[i][j], (j == BLOOM_FILTER_SIZE - 1) ? '\n' : ' ');
+        }
+    }
+}
+
+RunStats run_once(uint32_t seed, int dump_arrays_flag) {
+    reset_state();
+    srand(seed);
+
+    int new_flows = 0;
+
+    for (int i = 0; i < N; i++) {
+        uint64_t key = generate_flow_key();
+        uint32_t weight = generate_flow_weight();
+
+        uint8_t seen = update_and_check_new(key, weight);
+        if (seen == 0) {
+            new_flows++;
+        }
+
+        // keep a copy of what we sent for reference
+        flows[i].key = key;
+        for (int j = 0; j < D; ++j) {
+            flows[i].idx[j] = cms_hash(j, key);
+        }
+    }
+
+    if (dump_arrays_flag) {
+        printf("Processed %d keys (%d new)\n", N, new_flows);
+        dump_arrays();
+    }
+
+    // compute simple checksums for testing
+    uint64_t cms_total = 0;
+    for (int row = 0; row < D; ++row) {
+        for (int col = 0; col < W; ++col) {
+            cms_total += cms_sketch[row][col];
+        }
+    }
+
+    uint64_t bloom_ones = 0;
+    for (int i = 0; i < BLOOM_FILTER_HASH_COUNT; ++i) {
+        for (int j = 0; j < BLOOM_FILTER_SIZE; ++j) {
+            bloom_ones += bloom_filter_map[i][j] ? 1 : 0;
+        }
+    }
+
+    RunStats stats = { .processed = N, .new_flows = new_flows, .cms_total = cms_total, .bloom_ones = bloom_ones };
+    return stats;
+}
+
+int main(void) {
+    // Fixed seed for deterministic runs; set dump flag to 1 to mirror previous output
+    RunStats stats = run_once(12345u, 0);
+    printf("Processed %d keys (%d new)\n", stats.processed, stats.new_flows);
+    printf("cms_total=%llu bloom_ones=%llu\n", (unsigned long long)stats.cms_total,
+           (unsigned long long)stats.bloom_ones);
+    return stats.processed;
 }

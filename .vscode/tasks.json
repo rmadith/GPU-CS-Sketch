@@ -26,7 +26,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "mkdir -p build && clang -g -Wall -Wextra -std=c11 CPU/run.c CPU/server.c CPU/switch.c -o build/cpu-run"
+                "mkdir -p build && clang -g -Wall -Wextra -std=c11 CPU/run.c  CPU/switch.c -o build/cpu-run"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -35,6 +35,6 @@
             "problemMatcher": [
                 "$gcc"
             ]
-        }
+        },
     ]
 }
