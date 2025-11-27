@@ -19,6 +19,7 @@
 
 uint32_t cms_hash(int j, uint64_t key);
 uint8_t update_and_check_new(uint64_t key, uint32_t weight);
+
 extern uint32_t cms_sketch[D][W];
 extern uint8_t bloom_filter_map[8][BLOOM_FILTER_SIZE];
 
