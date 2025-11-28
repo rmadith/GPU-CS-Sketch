@@ -1,6 +1,10 @@
 #include "run.h"
 #include <string.h>
 
+#ifdef USE_CUDA
+#include "../GPU/server_gpu.h"
+#endif
+
 static int num_flows = 0; // how many distinct flows we've seen
 
 static int find_or_add_flow(uint64_t key) {
@@ -116,7 +120,11 @@ int main(void) {
   printf("cms_total=%llu bloom_ones=%llu\n",
          (unsigned long long)stats.cms_total,
          (unsigned long long)stats.bloom_ones);
+#ifdef USE_CUDA
+  server_reconstruct_omp_gpu(100, num_flows);
+#else
   server_reconstruct_omp(100);
+#endif
   for (int i = 0; i < num_flows; ++i) {
     if (!selected[i]) continue;
     double t = true_x[i];

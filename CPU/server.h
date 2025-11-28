@@ -14,11 +14,11 @@ typedef struct {
   uint32_t idx[D]; // D positions in y/r
 } FlowPattern;
 
-double y[M];          // flattened sketch (from switch)
-double r[M];          // residual
-FlowPattern flows[N]; // built from keys
-double x[N];          // flow sizes (output)
-int selected[N];      // 0/1 flags
+extern double y[M];          // flattened sketch (from switch)
+extern double r[M];          // residual
+extern FlowPattern flows[N]; // built from keys
+extern double x[N];          // flow sizes (output)
+extern int selected[N];      // 0/1 flags
 
 
 void server_reconstruct_omp(int K_max);

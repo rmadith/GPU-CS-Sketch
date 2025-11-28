@@ -4,6 +4,11 @@
 
 // server.c
 double true_x[N];
+double y[M];          // flattened sketch (from switch)
+double r[M];          // residual
+FlowPattern flows[N]; // built from keys
+double x[N];          // flow sizes (output)
+int selected[N];      // 0/1 flags
 
 
 
