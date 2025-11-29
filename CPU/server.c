@@ -1,6 +1,10 @@
 #include "server.h"
 #include <math.h>    // fabs, sqrt
 
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+
 
 // server.c
 double true_x[N];
@@ -16,6 +20,9 @@ int selected[N];      // 0/1 flags
 
 void server_flatten_cms_to_y(void) {
     // cms_sketch[row][col] -> y[row * W + col]
+#ifdef USE_OPENMP
+    #pragma omp parallel for collapse(2)
+#endif
     for (int row = 0; row < D; ++row) {
         for (int col = 0; col < W; ++col) {
             int idx_flat = row * W + col;
@@ -131,6 +138,35 @@ static int select_best_flow_index(void) {
     int best_i = -1;
     double best_score = 0.0;
 
+#ifdef USE_OPENMP
+    // Parallel argmax: each thread finds local best, then reduce
+    #pragma omp parallel
+    {
+        int local_best_i = -1;
+        double local_best_score = 0.0;
+        
+        #pragma omp for nowait
+        for (int i = 0; i < N; ++i) {
+            if (selected[i]) {
+                continue;
+            }
+            double s = flow_score_from_residual(r, &flows[i]);
+            double mag = fabs(s);
+            if (mag > local_best_score) {
+                local_best_score = mag;
+                local_best_i = i;
+            }
+        }
+        
+        #pragma omp critical
+        {
+            if (local_best_score > best_score) {
+                best_score = local_best_score;
+                best_i = local_best_i;
+            }
+        }
+    }
+#else
     for (int i = 0; i < N; ++i) {
         if (selected[i]) {
             continue; // already in support set
@@ -144,6 +180,7 @@ static int select_best_flow_index(void) {
             best_i = i;
         }
     }
+#endif
 
     // Optional: if best score is extremely small, we consider nothing left to explain
     if (best_i >= 0 && best_score <= 1e-9) {
@@ -157,11 +194,16 @@ static int select_best_flow_index(void) {
 // where S is the current support of size k and support_indices[p] = flow index in S.
 static void recompute_residual_from_support(const int *support_indices, int k) {
     // start with r = y
+#ifdef USE_OPENMP
+    #pragma omp parallel for
+#endif
     for (int m = 0; m < M; ++m) {
         r[m] = y[m];
     }
 
     // subtract contributions of all selected flows
+    // Note: This loop has potential race conditions on r[pos], so we keep it sequential
+    // or use atomic updates. For small k, sequential is fine.
     for (int p = 0; p < k; ++p) {
         int fi = support_indices[p];
         double coeff = x[fi];
@@ -178,6 +220,9 @@ static void recompute_residual_from_support(const int *support_indices, int k) {
 // Optional stopping rule: L2 norm of residual
 static double residual_l2_norm(void) {
     double sum_sq = 0.0;
+#ifdef USE_OPENMP
+    #pragma omp parallel for reduction(+:sum_sq)
+#endif
     for (int m = 0; m < M; ++m) {
         double v = r[m];
         sum_sq += v * v;
@@ -199,10 +244,16 @@ void server_reconstruct_omp(int K_max) {
     server_flatten_cms_to_y();
 
     // 2) Initialize x, selected, and residual
+#ifdef USE_OPENMP
+    #pragma omp parallel for
+#endif
     for (int i = 0; i < N; ++i) {
         x[i] = 0.0;
         selected[i] = 0;
     }
+#ifdef USE_OPENMP
+    #pragma omp parallel for
+#endif
     for (int m = 0; m < M; ++m) {
         r[m] = y[m];
     }
@@ -233,6 +284,9 @@ void server_reconstruct_omp(int K_max) {
         double a[cur_k];
 
         // Build G: G[p][q] = φ_{i_p}^T φ_{i_q} = overlap of patterns
+#ifdef USE_OPENMP
+        #pragma omp parallel for
+#endif
         for (int p = 0; p < cur_k; ++p) {
             int ip = support_indices[p];
             const FlowPattern *fp = &flows[ip];

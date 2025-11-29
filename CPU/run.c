@@ -5,9 +5,9 @@
 #include "../GPU/server_gpu.h"
 #endif
 
-static int num_flows = 0; // how many distinct flows we've seen
+int num_flows = 0; // how many distinct flows we've seen
 
-static int find_or_add_flow(uint64_t key) {
+int find_or_add_flow(uint64_t key) {
   // 1. look for existing flow
   for (int i = 0; i < num_flows; ++i) {
     if (flows[i].key == key) {
@@ -24,7 +24,7 @@ static int find_or_add_flow(uint64_t key) {
   return idx;
 }
 
-static uint64_t generate_flow_key(void) {
+uint64_t generate_flow_key(void) {
   // combine three rand() calls to fill 64 bits
   uint64_t a = (uint64_t)(rand() & 0xffff);
   uint64_t b = (uint64_t)rand();
@@ -32,11 +32,12 @@ static uint64_t generate_flow_key(void) {
   return (a << 48) ^ (b << 16) ^ c;
 }
 
-static uint32_t generate_flow_weight(void) {
+uint32_t generate_flow_weight(void) {
   return (uint32_t)(1 + (rand() % 100)); // weights in [1,100]
 }
 
-static void reset_state(void) {
+void reset_state(void) {
+  num_flows = 0;
   memset(cms_sketch, 0, sizeof(cms_sketch));
   memset(bloom_filter_map, 0, sizeof(bloom_filter_map));
   memset(flows, 0, sizeof(flows));

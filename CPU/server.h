@@ -4,7 +4,11 @@
 #include "switch.h"
 
 #define M (D * W)
-#define N 100 // number of flows
+
+// N can be overridden at compile time with -DN=<value>
+#ifndef N
+#define N 100 // default number of flows
+#endif
 
 
 extern double true_x[N];   // true flow weights for testing

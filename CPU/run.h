@@ -7,6 +7,14 @@
 #include <stdlib.h>
 #include <math.h>
 
+// Global state
+extern int num_flows;
+
+// Flow generation utilities (exposed for benchmark)
+uint64_t generate_flow_key(void);
+uint32_t generate_flow_weight(void);
+int find_or_add_flow(uint64_t key);
+void reset_state(void);
 
 typedef struct {
     int processed;
