@@ -7,6 +7,7 @@
  * 3. Fused correlation + argmax kernel
  * 4. Precomputed flow overlap matrix
  * 5. Incremental correlation updates via inverse index (with coefficient deltas)
+ * 6. Restricted search space (only scan flows in high-energy buckets)
  * 
  * Build: nvcc -O2 -std=c++14 -DUSE_CUDA -gencode arch=compute_75,code=sm_75 \
  *        CPU/run.c CPU/server.c CPU/switch.c GPU_Optimized/server_gpu_opt.cu -o gpu-opt-run
@@ -16,6 +17,7 @@
 #include "kernels/reduction.cuh"
 #include "kernels/correlation.cuh"
 #include "kernels/cholesky.cuh"
+#include "kernels/restricted_search.cuh"
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -242,6 +244,18 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
     int* d_inv_offset = nullptr;
     int* d_inv_flows = nullptr;
 #endif
+
+#if GPU_OPT_USE_RESTRICTED_SEARCH && GPU_OPT_USE_INCREMENTAL_CORR
+    // Restricted search buffers
+    float* d_abs_r = nullptr;           // |r[i]| for all buckets
+    int* d_heavy_buckets = nullptr;     // Indices of heavy buckets
+    int* d_heavy_count = nullptr;       // Number of heavy buckets found (atomic counter)
+    unsigned int* d_candidate_bitmap = nullptr;  // Bitmap for candidate deduplication
+    int* d_candidates = nullptr;        // Dense array of candidate flow indices
+    int* d_candidate_count = nullptr;   // Number of candidates (atomic counter)
+    float* d_restricted_tmp_val = nullptr;  // Scratch for restricted argmax
+    int* d_restricted_tmp_idx = nullptr;
+#endif
     
     // Sizes
     size_t y_bytes = GPU_OPT_M * sizeof(float);
@@ -250,6 +264,16 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
     int tmp_len = div_up(flow_count, reduce_block);
     int norm_tmp_len = div_up(GPU_OPT_M, reduce_block);
     int support_size = 0;
+    
+#if GPU_OPT_USE_RESTRICTED_SEARCH && GPU_OPT_USE_INCREMENTAL_CORR
+    // Restricted search sizes
+    // Max candidates = heavy_buckets * avg_bucket_load = K * (N*D/M)
+    int avg_bucket_load = (flow_count * GPU_OPT_D + GPU_OPT_M - 1) / GPU_OPT_M;
+    int max_candidates = GPU_OPT_HEAVY_BUCKET_COUNT * avg_bucket_load * 2;  // 2x safety margin
+    if (max_candidates > flow_count) max_candidates = flow_count;
+    int bitmap_words = (flow_count + 31) / 32;
+    int restricted_tmp_len = div_up(max_candidates, reduce_block);
+#endif
     
     // =========================================================================
     // Allocate Device Memory
@@ -278,6 +302,18 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
         fprintf(stderr, "Failed to build inverse index\n");
         goto cleanup;
     }
+#endif
+
+#if GPU_OPT_USE_RESTRICTED_SEARCH && GPU_OPT_USE_INCREMENTAL_CORR
+    // Allocate restricted search buffers
+    CUDA_CHECK(cudaMalloc(&d_abs_r, GPU_OPT_M * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_heavy_buckets, GPU_OPT_HEAVY_BUCKET_COUNT * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_heavy_count, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_candidate_bitmap, bitmap_words * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_candidates, max_candidates * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_candidate_count, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_restricted_tmp_val, restricted_tmp_len * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_restricted_tmp_idx, restricted_tmp_len * sizeof(int)));
 #endif
     
     // =========================================================================
@@ -319,8 +355,119 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
                 d_y, d_idx, flow_count, d_corr, d_tmp_val, d_tmp_idx);
             CUDA_CHECK(cudaGetLastError());
         } else {
-            // Subsequent iterations: correlations were updated incrementally
-            // Just do argmax on stored correlations
+#if GPU_OPT_USE_RESTRICTED_SEARCH
+            // Decide whether to use restricted search or full scan
+            bool use_restricted = (GPU_OPT_FULL_SCAN_INTERVAL == 0) ||
+                                  (support_size % GPU_OPT_FULL_SCAN_INTERVAL != 0);
+            
+            if (use_restricted) {
+                // ===============================================================
+                // Restricted Search Path: Only scan flows in high-energy buckets
+                // ===============================================================
+                
+                // Step 1+2 Fused: Compute |r[b]| AND find max in one pass
+                float max_abs_r = 0.0f;
+                {
+                    int fused_grid = div_up(GPU_OPT_M, reduce_block);
+                    compute_abs_and_max<<<fused_grid, reduce_block>>>(
+                        d_r, GPU_OPT_M, d_abs_r, d_tmp_norm);
+                    CUDA_CHECK(cudaGetLastError());
+                    
+                    // Reduce block-level max values to find global max
+                    int cur_n = fused_grid;
+                    while (cur_n > 1) {
+                        int next_blocks = div_up(cur_n, reduce_block);
+                        reduce_max_final<<<next_blocks, reduce_block>>>(
+                            d_tmp_norm, cur_n, d_tmp_norm);
+                        CUDA_CHECK(cudaGetLastError());
+                        cur_n = next_blocks;
+                    }
+                    CUDA_CHECK(cudaMemcpy(&max_abs_r, d_tmp_norm, sizeof(float),
+                                          cudaMemcpyDeviceToHost));
+                }
+                
+                // Step 3: Select heavy buckets using threshold
+                // Set threshold at fraction of max (select buckets with significant residual)
+                float threshold = max_abs_r * 0.1f;  // Top ~10% by magnitude
+                
+                // Reset heavy bucket count
+                CUDA_CHECK(cudaMemset(d_heavy_count, 0, sizeof(int)));
+                
+                int heavy_grid = div_up(GPU_OPT_M, block_size);
+                select_heavy_buckets_threshold<<<heavy_grid, block_size>>>(
+                    d_abs_r, GPU_OPT_M, threshold, d_heavy_buckets,
+                    d_heavy_count, GPU_OPT_HEAVY_BUCKET_COUNT);
+                CUDA_CHECK(cudaGetLastError());
+                
+                // Get number of heavy buckets found
+                int h_heavy_count = 0;
+                CUDA_CHECK(cudaMemcpy(&h_heavy_count, d_heavy_count, sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                
+                if (h_heavy_count == 0) {
+                    // No heavy buckets found, fall back to full scan
+                    goto full_scan_path;
+                }
+                if (h_heavy_count > GPU_OPT_HEAVY_BUCKET_COUNT) {
+                    h_heavy_count = GPU_OPT_HEAVY_BUCKET_COUNT;
+                }
+                
+                // Step 4: Build candidate set from heavy buckets
+                // Clear bitmap
+                CUDA_CHECK(cudaMemset(d_candidate_bitmap, 0,
+                                      bitmap_words * sizeof(unsigned int)));
+                
+                // Mark candidates in bitmap
+                mark_candidates_from_buckets<<<h_heavy_count, 256>>>(
+                    d_heavy_buckets, h_heavy_count, d_inv_offset, d_inv_flows,
+                    d_candidate_bitmap);
+                CUDA_CHECK(cudaGetLastError());
+                
+                // Compact to dense array (with bounds check)
+                CUDA_CHECK(cudaMemset(d_candidate_count, 0, sizeof(int)));
+                int compact_grid = div_up(flow_count, block_size);
+                compact_candidates<<<compact_grid, block_size>>>(
+                    d_candidate_bitmap, flow_count, d_candidates, d_candidate_count,
+                    max_candidates);
+                CUDA_CHECK(cudaGetLastError());
+                
+                int h_candidate_count = 0;
+                CUDA_CHECK(cudaMemcpy(&h_candidate_count, d_candidate_count, sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                
+                if (h_candidate_count == 0) {
+                    // No candidates, fall back to full scan
+                    goto full_scan_path;
+                }
+                if (h_candidate_count > max_candidates) {
+                    h_candidate_count = max_candidates;
+                }
+                
+                // Step 5: Restricted argmax over candidates only
+                int restricted_grid = div_up(h_candidate_count, reduce_block);
+                restricted_argmax_kernel<<<restricted_grid, reduce_block>>>(
+                    d_corr, d_candidates, h_candidate_count,
+                    d_restricted_tmp_val, d_restricted_tmp_idx);
+                CUDA_CHECK(cudaGetLastError());
+                
+                // Final reduction if needed
+                if (restricted_grid > 1) {
+                    restricted_argmax_final<<<1, reduce_block>>>(
+                        d_restricted_tmp_val, d_restricted_tmp_idx, restricted_grid,
+                        d_restricted_tmp_val, d_restricted_tmp_idx);
+                    CUDA_CHECK(cudaGetLastError());
+                }
+                CUDA_CHECK(cudaMemcpy(&best_val, d_restricted_tmp_val, sizeof(float),
+                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(&best_idx, d_restricted_tmp_idx, sizeof(int),
+                                      cudaMemcpyDeviceToHost));
+                
+                goto check_stopping;
+            }
+            
+full_scan_path:
+#endif // GPU_OPT_USE_RESTRICTED_SEARCH
+            // Full scan: argmax on all stored correlations
             if (!device_argmax_warp(d_corr, flow_count, d_tmp_val, d_tmp_idx,
                                     reduce_block, &best_val, &best_idx)) {
                 fprintf(stderr, "argmax failed\n");
@@ -440,6 +587,16 @@ cleanup:
     // =========================================================================
     // Cleanup
     // =========================================================================
+#if GPU_OPT_USE_RESTRICTED_SEARCH && GPU_OPT_USE_INCREMENTAL_CORR
+    if (d_restricted_tmp_idx) cudaFree(d_restricted_tmp_idx);
+    if (d_restricted_tmp_val) cudaFree(d_restricted_tmp_val);
+    if (d_candidate_count) cudaFree(d_candidate_count);
+    if (d_candidates) cudaFree(d_candidates);
+    if (d_candidate_bitmap) cudaFree(d_candidate_bitmap);
+    if (d_heavy_count) cudaFree(d_heavy_count);
+    if (d_heavy_buckets) cudaFree(d_heavy_buckets);
+    if (d_abs_r) cudaFree(d_abs_r);
+#endif
 #if GPU_OPT_USE_INCREMENTAL_CORR
     if (d_inv_flows) cudaFree(d_inv_flows);
     if (d_inv_offset) cudaFree(d_inv_offset);

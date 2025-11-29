@@ -32,6 +32,19 @@ extern "C" {
 // Tracks coefficient DELTAS for all selected flows (not just new one)
 #define GPU_OPT_USE_INCREMENTAL_CORR 1
 
+// Use restricted search space for argmax (only scan flows in high-energy buckets)
+// Reduces argmax from O(N) to O(K * bucket_load) per iteration
+// Requires GPU_OPT_USE_INCREMENTAL_CORR to be enabled
+#define GPU_OPT_USE_RESTRICTED_SEARCH 1
+
+// Number of heavy buckets to consider for restricted search
+// Higher values increase accuracy but reduce speedup
+#define GPU_OPT_HEAVY_BUCKET_COUNT   32
+
+// Periodic full scan interval (do full argmax every N iterations for safety)
+// Set to 0 to disable periodic full scans (not recommended)
+#define GPU_OPT_FULL_SCAN_INTERVAL   10
+
 // =============================================================================
 // Kernel Configuration
 // =============================================================================
