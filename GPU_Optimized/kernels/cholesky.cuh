@@ -48,6 +48,77 @@ template __global__ void precompute_overlaps<4>(const int* __restrict__, int,
                                                  signed char*);
 
 // =============================================================================
+// Support Overlap Cache Kernels
+// =============================================================================
+
+/**
+ * Compute overlaps between a newly selected flow and all existing support flows.
+ * Parallelizes across existing support flows (one thread per support flow).
+ * 
+ * @param idx              Flow index array (N * D entries)
+ * @param lambda           Newly selected flow index
+ * @param S                Support set (selected flow indices)
+ * @param k                Current support size (before adding lambda)
+ * @param support_overlap  K_max x K_max support overlap cache
+ * @param max_k            Maximum support size (matrix stride)
+ */
+template<int D_VAL>
+__global__ void compute_support_flow_overlap(
+    const int* __restrict__ idx,
+    int lambda,
+    const int* __restrict__ S,
+    int k,
+    signed char* support_overlap,
+    int max_k) {
+    
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Compute overlap with existing support flows
+    if (p < k) {
+        int other = S[p];
+        int lambda_base = lambda * D_VAL;
+        int other_base = other * D_VAL;
+        
+        signed char count = 0;
+        #pragma unroll
+        for (int d = 0; d < D_VAL; ++d) {
+            if (idx[lambda_base + d] == idx[other_base + d]) {
+                count++;
+            }
+        }
+        
+        // Store in row k (new flow's row), column p
+        support_overlap[k * max_k + p] = count;
+        // Store symmetric: row p, column k
+        support_overlap[p * max_k + k] = count;
+    }
+    
+    // Thread 0 always sets the diagonal (self-overlap), even when k=0
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        // Compute unique positions for diagonal
+        int lambda_base = lambda * D_VAL;
+        int lambda_rows[D_VAL];
+        #pragma unroll
+        for (int d = 0; d < D_VAL; ++d) {
+            lambda_rows[d] = idx[lambda_base + d];
+        }
+        
+        signed char unique = D_VAL;
+        for (int a = 0; a < D_VAL; ++a) {
+            for (int b = a + 1; b < D_VAL; ++b) {
+                if (lambda_rows[a] == lambda_rows[b]) {
+                    unique--;
+                }
+            }
+        }
+        support_overlap[k * max_k + k] = unique;
+    }
+}
+
+template __global__ void compute_support_flow_overlap<4>(
+    const int* __restrict__, int, const int* __restrict__, int, signed char*, int);
+
+// =============================================================================
 // Incremental Cholesky Update Kernel
 // =============================================================================
 
@@ -57,17 +128,18 @@ template __global__ void precompute_overlaps<4>(const int* __restrict__, int,
  * 
  * For large K (> threshold), use cuSOLVER instead.
  * 
- * @param y          Original measurement vector (length M)
- * @param r          Residual vector (length M, updated in place)
- * @param idx        Flow index array (N * D)
- * @param lambda     Newly selected flow index
- * @param S          Support set (selected flow indices)
- * @param k          Current support size (before adding lambda)
- * @param L          Cholesky factor (K_max x K_max, lower triangular)
- * @param x          Flow coefficients (length K_max)
- * @param max_k      Maximum support size (for matrix stride)
- * @param overlap    Precomputed overlap matrix (N x N, int8) or NULL
- * @param n          Total number of flows (for overlap indexing)
+ * @param y                Original measurement vector (length M)
+ * @param r                Residual vector (length M, updated in place)
+ * @param idx              Flow index array (N * D)
+ * @param lambda           Newly selected flow index
+ * @param S                Support set (selected flow indices)
+ * @param k                Current support size (before adding lambda)
+ * @param L                Cholesky factor (K_max x K_max, lower triangular)
+ * @param x                Flow coefficients (length K_max)
+ * @param max_k            Maximum support size (for matrix stride)
+ * @param overlap          Precomputed overlap matrix (N x N, int8) or NULL
+ * @param n                Total number of flows (for overlap indexing)
+ * @param support_overlap  Support overlap cache (K x K, int8) or NULL (NEW)
  */
 template<int D_VAL>
 __global__ void update_cholesky_and_residual(
@@ -81,7 +153,8 @@ __global__ void update_cholesky_and_residual(
     float* x,
     int max_k,
     const signed char* __restrict__ overlap,
-    int n) {
+    int n,
+    const signed char* __restrict__ support_overlap = nullptr) {
     
     extern __shared__ float shmem[];
     float* v = shmem;                    // Overlaps with existing support (k elements)
@@ -110,14 +183,34 @@ __global__ void update_cholesky_and_residual(
         
         // Compute overlaps with existing support
         // v[p] = overlap(lambda, S[p])
-        for (int p = 0; p < k; ++p) {
-            int other = S[p];
-            
-            if (overlap != NULL) {
-                // Use precomputed overlap matrix
+        int unique_rows = D_VAL;
+        
+        if (support_overlap != nullptr) {
+            // Use precomputed support overlap cache (K x K)
+            // Already computed by compute_support_flow_overlap kernel
+            for (int p = 0; p < k; ++p) {
+                v[p] = (float)support_overlap[k * max_k + p];
+            }
+            // Diagonal is also precomputed
+            unique_rows = (int)support_overlap[k * max_k + k];
+        } else if (overlap != nullptr) {
+            // Use precomputed full overlap matrix (N x N)
+            for (int p = 0; p < k; ++p) {
+                int other = S[p];
                 v[p] = (float)overlap[lambda * n + other];
-            } else {
-                // Compute overlap on the fly
+            }
+            // Compute diagonal
+            for (int a = 0; a < D_VAL; ++a) {
+                for (int b_idx = a + 1; b_idx < D_VAL; ++b_idx) {
+                    if (lambda_rows[a] == lambda_rows[b_idx]) {
+                        unique_rows--;
+                    }
+                }
+            }
+        } else {
+            // Compute overlap on the fly
+            for (int p = 0; p < k; ++p) {
+                int other = S[p];
                 int other_base = other * D_VAL;
                 int count = 0;
                 #pragma unroll
@@ -128,14 +221,12 @@ __global__ void update_cholesky_and_residual(
                 }
                 v[p] = (float)count;
             }
-        }
-        
-        // Compute diagonal element (self-overlap = number of unique positions)
-        int unique_rows = D_VAL;
-        for (int a = 0; a < D_VAL; ++a) {
-            for (int b_idx = a + 1; b_idx < D_VAL; ++b_idx) {
-                if (lambda_rows[a] == lambda_rows[b_idx]) {
-                    unique_rows--;
+            // Compute diagonal
+            for (int a = 0; a < D_VAL; ++a) {
+                for (int b_idx = a + 1; b_idx < D_VAL; ++b_idx) {
+                    if (lambda_rows[a] == lambda_rows[b_idx]) {
+                        unique_rows--;
+                    }
                 }
             }
         }
@@ -211,7 +302,8 @@ __global__ void update_cholesky_and_residual(
 
 template __global__ void update_cholesky_and_residual<4>(
     const float* __restrict__, float*, const int* __restrict__,
-    int, int*, int, float*, float*, int, const signed char* __restrict__, int);
+    int, int*, int, float*, float*, int, const signed char* __restrict__, int,
+    const signed char* __restrict__);
 
 // =============================================================================
 // Utility Kernels

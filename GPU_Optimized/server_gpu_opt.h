@@ -23,9 +23,16 @@ extern "C" {
 // =============================================================================
 
 // Use precomputed N x N overlap matrix (int8)
-// Memory: N^2 bytes (10k flows = 100MB)
+// Memory: N^2 bytes (10k flows = 100MB, 100k flows = 10GB!)
 // Trades memory for O(1) overlap lookups during Cholesky
-#define GPU_OPT_PRECOMPUTE_OVERLAPS  1
+// WARNING: Disable for N > 10000 to avoid GPU OOM
+#define GPU_OPT_PRECOMPUTE_OVERLAPS  0
+
+// Use incremental K x K support overlap cache (int8)
+// Memory: K^2 bytes (K=100 = 10KB, K=1000 = 1MB)
+// Builds overlap cache incrementally as flows are selected
+// Much more memory-efficient than full N x N precomputation
+#define GPU_OPT_USE_SUPPORT_OVERLAP_CACHE 1
 
 // Use incremental correlation updates via inverse index
 // O(N*D/M * K) per iteration vs O(N*D) for full recompute

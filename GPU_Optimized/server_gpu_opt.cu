@@ -238,6 +238,9 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
     int* d_tmp_idx = nullptr;
     float* d_tmp_norm = nullptr;
     signed char* d_overlap = nullptr;
+#if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
+    signed char* d_support_overlap = nullptr;  // K x K support overlap cache
+#endif
 #if GPU_OPT_USE_INCREMENTAL_CORR
     float* d_corr = nullptr;
     float* d_x_old = nullptr;  // Store old coefficients for delta computation
@@ -291,6 +294,12 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
 #if GPU_OPT_PRECOMPUTE_OVERLAPS
     // Allocate overlap matrix (N x N int8)
     CUDA_CHECK(cudaMalloc(&d_overlap, (size_t)flow_count * flow_count * sizeof(signed char)));
+#endif
+
+#if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
+    // Allocate support overlap cache (K x K int8) - much smaller than N x N
+    CUDA_CHECK(cudaMalloc(&d_support_overlap, (size_t)K_max * K_max * sizeof(signed char)));
+    CUDA_CHECK(cudaMemset(d_support_overlap, 0, (size_t)K_max * K_max * sizeof(signed char)));
 #endif
     
 #if GPU_OPT_USE_INCREMENTAL_CORR
@@ -515,14 +524,30 @@ check_stopping:
         // =====================================================================
         // Update Cholesky and Residual
         // =====================================================================
+#if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
+        // Compute overlaps between new flow and existing support (parallel)
+        // Even for first flow (support_size=0), we launch with 1 block to compute diagonal
+        {
+            int overlap_threads = (support_size > 0) ? support_size : 1;
+            int overlap_blocks = div_up(overlap_threads, 256);
+            compute_support_flow_overlap<GPU_OPT_D><<<overlap_blocks, 256>>>(
+                d_idx, best_idx, d_S, support_size, d_support_overlap, K_max);
+            CUDA_CHECK(cudaGetLastError());
+        }
+#endif
         {
             size_t shmem = (size_t)K_max * 4 * sizeof(float);
             update_cholesky_and_residual<GPU_OPT_D><<<1, 256, shmem>>>(
                 d_y, d_r, d_idx, best_idx, d_S, support_size, d_L, d_x, K_max,
 #if GPU_OPT_PRECOMPUTE_OVERLAPS
-                d_overlap, flow_count
+                d_overlap, flow_count,
 #else
-                nullptr, 0
+                nullptr, 0,
+#endif
+#if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
+                d_support_overlap
+#else
+                nullptr
 #endif
             );
             CUDA_CHECK(cudaGetLastError());
@@ -602,6 +627,9 @@ cleanup:
     if (d_inv_offset) cudaFree(d_inv_offset);
     if (d_x_old) cudaFree(d_x_old);
     if (d_corr) cudaFree(d_corr);
+#endif
+#if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
+    if (d_support_overlap) cudaFree(d_support_overlap);
 #endif
     if (d_overlap) cudaFree(d_overlap);
     if (d_tmp_norm) cudaFree(d_tmp_norm);
