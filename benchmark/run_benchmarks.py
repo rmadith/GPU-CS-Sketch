@@ -18,6 +18,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
 import re
+import threading
+import queue
 
 # Try to import matplotlib for plotting
 try:
@@ -30,7 +32,7 @@ except ImportError:
     print("Warning: matplotlib not installed. Plotting will be skipped.")
 
 # Benchmark configuration
-N_VALUES = [100, 1000, 10000, 100000, 500000, 1000000, 2000000]
+N_VALUES = [100, 1000, 10000, 100000, 500000, 1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000, 128000000, 256000000, 512000000, 1024000000]
 K_VALUES = [50, 100, 500]
 DISTRIBUTIONS = ["uniform", "zipf", "heavy_elephant", "heavy_mice", "bimodal"]
 
@@ -60,7 +62,7 @@ IMPLEMENTATIONS = {
     },
     "cpu_omp": {
         "compiler": "gcc",
-        "flags": f"-O3 -march=native {OMP_FLAGS} -std=c11",
+        "flags": f"",
         "sources": "benchmark/benchmark.c CPU/switch.c CPU/server.c",
         "libs": f"-lm {OMP_LIBS}",
         "defines": "-DUSE_OPENMP",
@@ -68,7 +70,7 @@ IMPLEMENTATIONS = {
     "gpu": {
         "compiler": "nvcc",
         "flags": "-O3 --use_fast_math -std=c++14",
-        "arch": "-gencode arch=compute_75,code=sm_75",
+        "arch": "",
         "sources": "benchmark/benchmark.c CPU/server.c CPU/switch.c GPU/server_gpu.cu",
         "libs": "",
         "defines": "-DUSE_CUDA",
@@ -116,6 +118,8 @@ def compile_implementation(impl_name: str, n: int, project_root: Path) -> Tuple[
             f"{impl.get('arch', '')} {impl['sources']} -o {output} {impl['libs']}"
         )
     
+    print(f"  Compilation command: {cmd}")
+    
     try:
         result = subprocess.run(
             cmd,
@@ -125,9 +129,14 @@ def compile_implementation(impl_name: str, n: int, project_root: Path) -> Tuple[
             text=True
         )
         if result.returncode != 0:
+            print(f"  Compilation stderr: {result.stderr}")
             return False, f"Compilation failed: {result.stderr}"
+        if result.stdout:
+            print(f"  Compilation stdout: {result.stdout}")
+        print(f"  ✓ Compilation successful: {output}")
         return True, str(output)
     except Exception as e:
+        print(f"  Exception during compilation: {e}")
         return False, str(e)
 
 def run_benchmark(executable: str, impl_name: str, k: int, dist: str = "all") -> List[BenchmarkResult]:
@@ -136,17 +145,78 @@ def run_benchmark(executable: str, impl_name: str, k: int, dist: str = "all") ->
     if dist != "all":
         cmd += f" --dist {dist}"
     
+    print(f"    Executing: {cmd}")
+    print()  # Add blank line before streaming output
+    
     try:
-        result = subprocess.run(
+        # Use Popen to stream output in real-time
+        process = subprocess.Popen(
             cmd,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=3600  # 1 hour timeout
+            bufsize=1,  # Line buffered
         )
         
+        # Queues to collect output
+        stdout_queue = queue.Queue()
+        stderr_queue = queue.Queue()
+        
+        def read_stdout():
+            for line in iter(process.stdout.readline, ''):
+                stdout_queue.put(line.rstrip())
+            process.stdout.close()
+        
+        def read_stderr():
+            for line in iter(process.stderr.readline, ''):
+                stderr_queue.put(line.rstrip())
+            process.stderr.close()
+        
+        # Start threads to read output
+        stdout_thread = threading.Thread(target=read_stdout)
+        stderr_thread = threading.Thread(target=read_stderr)
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        # Collect and print output in real-time
+        stdout_lines = []
+        stderr_lines = []
+        
+        while process.poll() is None or not stdout_queue.empty() or not stderr_queue.empty():
+            # Process stderr (benchmark progress)
+            while not stderr_queue.empty():
+                try:
+                    line = stderr_queue.get_nowait()
+                    if line:
+                        stderr_lines.append(line)
+                        print(f"    {line}", flush=True)
+                except queue.Empty:
+                    break
+            
+            # Process stdout (RESULT lines and other output)
+            while not stdout_queue.empty():
+                try:
+                    line = stdout_queue.get_nowait()
+                    if line:
+                        stdout_lines.append(line)
+                        if not line.startswith("RESULT,"):
+                            print(f"    {line}", flush=True)
+                except queue.Empty:
+                    break
+        
+        # Wait for threads to finish
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        
+        # Wait for process to complete
+        return_code = process.wait(timeout=3600)
+        
+        # Parse RESULT lines
         results = []
-        for line in result.stdout.strip().split("\n"):
+        for line in stdout_lines:
             if line.startswith("RESULT,"):
                 parts = line.split(",")
                 if len(parts) >= 8:
@@ -159,12 +229,15 @@ def run_benchmark(executable: str, impl_name: str, k: int, dist: str = "all") ->
                         stddev_ms=float(parts[6]),
                         throughput=float(parts[7])
                     ))
+                    print(f"    ✓ {parts[1]}: {parts[5]}ms (±{parts[6]}ms), {float(parts[7])/1e6:.2f}M flows/sec", flush=True)
+        
+        print()  # Add blank line after output
         return results
     except subprocess.TimeoutExpired:
-        print(f"  Timeout running {executable}")
+        print(f"    ✗ Timeout running {executable}")
         return []
     except Exception as e:
-        print(f"  Error running {executable}: {e}")
+        print(f"    ✗ Error running {executable}: {e}")
         return []
 
 def save_results(results: List[BenchmarkResult], output_file: Path):
@@ -433,9 +506,17 @@ def main():
     parser.add_argument("--ks", type=str, default="100", help="Comma-separated list of K values to test")
     args = parser.parse_args()
     
+    print("\n" + "="*70)
+    print("  OMP BENCHMARK RUNNER")
+    print("="*70)
+    
     project_root = get_project_root()
     output_dir = project_root / "benchmark" / "results"
     output_dir.mkdir(exist_ok=True)
+    
+    print(f"📁 Project root: {project_root}")
+    print(f"📁 Output directory: {output_dir}")
+    print(f"🖥️  Platform: {'macOS' if IS_MACOS else 'Linux'}")
     
     # Parse implementation list
     if args.impls == "all":
@@ -456,63 +537,115 @@ def main():
     
     if args.plot_only:
         # Load existing results
+        print("=" * 70)
+        print("PLOT-ONLY MODE: Loading existing results")
+        print("=" * 70)
         csv_file = output_dir / "raw_data.csv"
         if csv_file.exists():
             all_results = load_results(csv_file)
-            print(f"Loaded {len(all_results)} results from {csv_file}")
+            print(f"✓ Loaded {len(all_results)} results from {csv_file}")
         else:
-            print(f"Error: {csv_file} not found")
+            print(f"✗ Error: {csv_file} not found")
             return 1
     else:
+        print("=" * 70)
+        print("BENCHMARK EXECUTION")
+        print("=" * 70)
+        print(f"Implementations to test: {', '.join(impls_to_run)}")
+        print(f"N values: {', '.join(f'{n:,}' for n in ns_to_run)}")
+        print(f"K values: {', '.join(str(k) for k in ks_to_run)}")
+        print(f"Distributions: {', '.join(DISTRIBUTIONS)}")
+        print("=" * 70)
+        
         # Compile and run benchmarks
+        total_tasks = len(impls_to_run) * len(ns_to_run) * len(ks_to_run)
+        current_task = 0
+        
         for impl in impls_to_run:
             if impl not in IMPLEMENTATIONS:
-                print(f"Warning: Unknown implementation '{impl}', skipping")
+                print(f"⚠ Warning: Unknown implementation '{impl}', skipping")
                 continue
             
             # Check if compiler is available
             compiler = IMPLEMENTATIONS[impl]["compiler"]
+            print(f"\n▶ Checking {compiler} availability...")
             try:
-                subprocess.run([compiler, "--version"], capture_output=True, check=True)
+                version_result = subprocess.run([compiler, "--version"], capture_output=True, check=True, text=True)
+                print(f"  ✓ {compiler} found: {version_result.stdout.split()[0] if version_result.stdout else 'version unknown'}")
             except (subprocess.CalledProcessError, FileNotFoundError):
-                print(f"Warning: {compiler} not found, skipping {impl}")
+                print(f"  ✗ {compiler} not found, skipping {impl}")
                 continue
             
             for n in ns_to_run:
-                print(f"Processing {impl} with N={n:,}...")
+                print(f"\n{'='*70}")
+                print(f"▶ Processing {impl.upper()} with N={n:,}")
+                print(f"{'='*70}")
                 
                 if not args.skip_compile:
-                    print(f"  Compiling...")
+                    print(f"📦 Compiling {impl} for N={n:,}...")
                     success, result = compile_implementation(impl, n, project_root)
                     if not success:
-                        print(f"  Failed: {result}")
+                        print(f"  ✗ Compilation failed: {result}")
                         continue
                     executable = result
                 else:
                     executable = str(project_root / "build" / f"{impl}-bench-n{n}")
+                    print(f"⏭  Skipping compilation, using existing executable: {executable}")
                 
                 if not args.skip_run:
                     for k in ks_to_run:
-                        print(f"  Running with K={k}...")
+                        current_task += 1
+                        print(f"\n  🚀 Running benchmarks with K={k} [{current_task}/{total_tasks}]...")
                         results = run_benchmark(executable, impl, k)
                         all_results.extend(results)
-                        print(f"  Got {len(results)} results")
+                        print(f"  ✓ Collected {len(results)} results")
+                else:
+                    print(f"  ⏭  Skipping benchmark runs")
         
         # Save results
+        print(f"\n{'='*70}")
         if all_results:
-            save_results(all_results, output_dir / "raw_data.csv")
-            print(f"\nSaved {len(all_results)} results to {output_dir / 'raw_data.csv'}")
+            output_file = output_dir / "raw_data.csv"
+            save_results(all_results, output_file)
+            print(f"💾 Saved {len(all_results)} total results to {output_file}")
+        else:
+            print("⚠ No results to save")
+        print(f"{'='*70}")
     
     # Generate plots
     if all_results and HAS_MATPLOTLIB:
-        print("\nGenerating plots...")
+        print(f"\n{'='*70}")
+        print("📊 GENERATING PLOTS")
+        print(f"{'='*70}")
+        
+        print("  📈 Generating time vs N plot...")
         plot_time_vs_n(all_results, output_dir)
+        print(f"    ✓ Saved: {output_dir / 'time_vs_n.png'}")
+        
+        print("  📊 Generating throughput bar chart...")
         plot_throughput_bars(all_results, output_dir)
+        print(f"    ✓ Saved: {output_dir / 'throughput_bars.png'}")
+        
+        print("  🔥 Generating speedup heatmap...")
         plot_speedup_heatmap(all_results, output_dir)
+        print(f"    ✓ Saved: {output_dir / 'speedup_heatmap.png'}")
+        
+        print("  💪 Generating stress test plot...")
         plot_stress_test(all_results, output_dir)
+        print(f"    ✓ Saved: {output_dir / 'stress_test.png'}")
+        
+        print("  📝 Generating report...")
         generate_report(all_results, output_dir)
-        print(f"Plots saved to {output_dir}")
+        print(f"    ✓ Saved: {output_dir / 'report.md'}")
+        
+        print(f"\n✅ All plots saved to {output_dir}")
+        print(f"{'='*70}")
+    elif all_results and not HAS_MATPLOTLIB:
+        print("\n⚠ matplotlib not installed, skipping plot generation")
+    elif not all_results:
+        print("\n⚠ No results available for plotting")
     
+    print("\n🎉 Benchmark run complete!")
     return 0
 
 if __name__ == "__main__":
