@@ -17,9 +17,11 @@
 #include "kernels/reduction.cuh"
 #include "kernels/correlation.cuh"
 #include "kernels/cholesky.cuh"
+#include "kernels/cholesky_cublas.cuh"
 #include "kernels/restricted_search.cuh"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
@@ -40,6 +42,16 @@ extern "C" {
         if (_err != cudaSuccess) {                                             \
             fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,      \
                     cudaGetErrorString(_err));                                 \
+            goto cleanup;                                                      \
+        }                                                                      \
+    } while (0)
+
+#define CUBLAS_CHECK(expr)                                                     \
+    do {                                                                       \
+        cublasStatus_t _status = (expr);                                       \
+        if (_status != CUBLAS_STATUS_SUCCESS) {                                \
+            fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__,    \
+                    _status);                                                  \
             goto cleanup;                                                      \
         }                                                                      \
     } while (0)
@@ -259,6 +271,12 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
     float* d_restricted_tmp_val = nullptr;  // Scratch for restricted argmax
     int* d_restricted_tmp_idx = nullptr;
 #endif
+
+    // cuBLAS handle and scratch buffers for parallel triangular solves
+    cublasHandle_t cublas_handle = nullptr;
+    float* d_cublas_v = nullptr;        // Scratch: overlap vector (K floats)
+    float* d_cublas_b = nullptr;        // Scratch: RHS vector (K floats)
+    float* d_cublas_diag = nullptr;     // Scratch: single float for diagonal
     
     // Sizes
     size_t y_bytes = GPU_OPT_M * sizeof(float);
@@ -324,6 +342,12 @@ extern "C" void server_reconstruct_omp_gpu(int K_max, int flow_count) {
     CUDA_CHECK(cudaMalloc(&d_restricted_tmp_val, restricted_tmp_len * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_restricted_tmp_idx, restricted_tmp_len * sizeof(int)));
 #endif
+
+    // Initialize cuBLAS for parallel triangular solves
+    CUBLAS_CHECK(cublasCreate(&cublas_handle));
+    CUDA_CHECK(cudaMalloc(&d_cublas_v, K_max * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cublas_b, K_max * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cublas_diag, sizeof(float)));
     
     // =========================================================================
     // Initialize Device Memory
@@ -522,7 +546,7 @@ check_stopping:
 #endif
         
         // =====================================================================
-        // Update Cholesky and Residual
+        // Update Cholesky and Residual (using cuBLAS for parallel triangular solves)
         // =====================================================================
 #if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
         // Compute overlaps between new flow and existing support (parallel)
@@ -535,22 +559,22 @@ check_stopping:
             CUDA_CHECK(cudaGetLastError());
         }
 #endif
-        {
-            size_t shmem = (size_t)K_max * 4 * sizeof(float);
-            update_cholesky_and_residual<GPU_OPT_D><<<1, 256, shmem>>>(
-                d_y, d_r, d_idx, best_idx, d_S, support_size, d_L, d_x, K_max,
-#if GPU_OPT_PRECOMPUTE_OVERLAPS
-                d_overlap, flow_count,
-#else
-                nullptr, 0,
-#endif
+        // Use cuBLAS for parallel triangular solves (major speedup for large K)
+        if (!cublas_cholesky_update_and_solve(
+                cublas_handle,
+                d_y, d_r, d_idx,
+                best_idx,
+                d_S, support_size,
+                d_L, d_x, K_max,
+                d_cublas_v, d_cublas_b, d_cublas_diag,
 #if GPU_OPT_USE_SUPPORT_OVERLAP_CACHE
-                d_support_overlap
+                d_support_overlap,
 #else
-                nullptr
+                nullptr,
 #endif
-            );
-            CUDA_CHECK(cudaGetLastError());
+                0)) {
+            fprintf(stderr, "cuBLAS Cholesky solve failed at iteration %d\n", support_size);
+            break;
         }
         
 #if GPU_OPT_USE_INCREMENTAL_CORR
@@ -612,6 +636,12 @@ cleanup:
     // =========================================================================
     // Cleanup
     // =========================================================================
+    // cuBLAS cleanup
+    if (d_cublas_diag) cudaFree(d_cublas_diag);
+    if (d_cublas_b) cudaFree(d_cublas_b);
+    if (d_cublas_v) cudaFree(d_cublas_v);
+    if (cublas_handle) cublasDestroy(cublas_handle);
+    
 #if GPU_OPT_USE_RESTRICTED_SEARCH && GPU_OPT_USE_INCREMENTAL_CORR
     if (d_restricted_tmp_idx) cudaFree(d_restricted_tmp_idx);
     if (d_restricted_tmp_val) cudaFree(d_restricted_tmp_val);
