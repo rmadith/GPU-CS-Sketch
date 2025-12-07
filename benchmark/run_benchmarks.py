@@ -83,6 +83,21 @@ IMPLEMENTATIONS = {
         "libs": "",
         "defines": "-DUSE_CUDA",
     },
+    "gpu_multi": {
+        "compiler": "nvcc",
+        "flags": "-O3 --use_fast_math -std=c++17",
+        # H200
+        "arch": "-gencode arch=compute_90,code=sm_90",
+        "sources": (
+            "benchmark/benchmark.c "
+            "CPU/server.c CPU/switch.c "
+            "GPU_Multi/server_gpu_multi.cu "
+            "GPU_Multi/server_gpu_multi_entry.cu"
+        ),
+        # link NCCL
+        "libs": "-lnccl",
+        "defines": "-DUSE_CUDA",
+    },
 }
 
 @dataclass
