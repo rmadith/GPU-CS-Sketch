@@ -55,21 +55,21 @@ else:
 IMPLEMENTATIONS = {
     "cpu": {
         "compiler": "gcc",
-        "flags": "-O3 -march=native -std=c11",
+        "flags": "-O3 -march=native -std=c11 -mcmodel=medium",
         "sources": "benchmark/benchmark.c CPU/switch.c CPU/server.c",
         "libs": "-lm",
         "defines": "",
     },
     "cpu_omp": {
         "compiler": "gcc",
-        "flags": f"",
+        "flags": f"-mcmodel=medium",
         "sources": "benchmark/benchmark.c CPU/switch.c CPU/server.c",
         "libs": f"-lm {OMP_LIBS}",
         "defines": "-DUSE_OPENMP",
     },
     "gpu": {
         "compiler": "nvcc",
-        "flags": "-O3 --use_fast_math -std=c++14",
+        "flags": "-O3 --use_fast_math -std=c++14 -Xcompiler -mcmodel=medium",
         "arch": "",
         "sources": "benchmark/benchmark.c CPU/server.c CPU/switch.c GPU/server_gpu.cu",
         "libs": "",
@@ -77,10 +77,10 @@ IMPLEMENTATIONS = {
     },
     "gpu_opt": {
         "compiler": "nvcc",
-        "flags": "-O3 --use_fast_math -std=c++14",
-        "arch": "-gencode arch=compute_75,code=sm_75",
+        "flags": "-O3 --use_fast_math -std=c++14 -Xcompiler -mcmodel=medium",
+        "arch": "",  # Let nvcc auto-detect GPU architecture
         "sources": "benchmark/benchmark.c CPU/server.c CPU/switch.c GPU_Optimized/server_gpu_opt.cu",
-        "libs": "",
+        "libs": "-lcublas",  # cuBLAS for parallel triangular solves
         "defines": "-DUSE_CUDA",
     },
     "gpu_multi": {
@@ -376,7 +376,7 @@ def plot_speedup_heatmap(results: List[BenchmarkResult], output_dir: Path, k: in
         for j, n in enumerate(available_ns):
             cpu_data = [r for r in results if r.distribution == dist and r.impl == "cpu" 
                        and r.n == n and r.k == k]
-            gpu_opt_data = [r for r in results if r.distribution == dist and r.impl == "gpu_opt" 
+            gpu_opt_data = [r for r in results if r.distribution == dist and r.impl == "gpu" 
                           and r.n == n and r.k == k]
             
             if cpu_data and gpu_opt_data:
@@ -401,7 +401,7 @@ def plot_speedup_heatmap(results: List[BenchmarkResult], output_dir: Path, k: in
     
     ax.set_xlabel("Number of Flows (N)")
     ax.set_ylabel("Distribution")
-    ax.set_title(f"GPU-Optimized Speedup vs CPU (K={k})")
+    ax.set_title(f"GPU vs CPU (K={k})")
     
     cbar = plt.colorbar(im, ax=ax)
     cbar.set_label("Speedup (x)")

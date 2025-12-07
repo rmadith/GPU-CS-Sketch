@@ -53,6 +53,14 @@ extern "C" {
 #define GPU_OPT_FULL_SCAN_INTERVAL   10
 
 // =============================================================================
+// cuBLAS Integration
+// =============================================================================
+
+// Uses cuBLAS for parallel triangular solves in Cholesky update.
+// This provides significant speedup for large K (K > 100).
+// Requires linking with -lcublas.
+
+// =============================================================================
 // Kernel Configuration
 // =============================================================================
 
